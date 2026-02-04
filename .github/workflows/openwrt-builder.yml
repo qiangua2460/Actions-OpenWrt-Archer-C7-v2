@@ -1,4 +1,4 @@
-name: OpenWrt Builder for TP-Link Archer C7 v2 (Optimized)
+name: OpenWrt Builder for TP-Link Archer C7 v2 (CCache Optimized)
 
 on:
   workflow_dispatch:
@@ -7,10 +7,10 @@ on:
         description: 'Clean build'
         required: false
         default: 'false'
-      enable_ccache:
-        description: 'Enable CCache for faster rebuild'
+      ccache_size:
+        description: 'CCache size (GB)'
         required: false
-        default: 'true'
+        default: '10'
 
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede
@@ -28,7 +28,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 90
 
     steps:
     - name: Checkout
@@ -43,36 +43,13 @@ jobs:
         free -h
         echo "CPU 信息:"
         nproc
-        cat /proc/cpuinfo | grep "model name" | head -2
+        lscpu | grep "Model name"
 
-    - name: Setup 8GB swap file
-      run: |
-        echo "=== 设置 8GB Swap 文件 ==="
-        
-        # 检查当前 Swap
-        echo "当前 Swap 信息:"
-        swapon --show
-        
-        # 创建 8GB Swap 文件
-        sudo fallocate -l 8G /swapfile
-        sudo chmod 600 /swapfile
-        sudo mkswap /swapfile
-        sudo swapon /swapfile
-        
-        # 验证 Swap
-        echo "Swap 设置完成:"
-        free -h
-        swapon --show
-        
-        # 设置 swappiness 优化编译性能
-        echo "vm.swappiness = 10" | sudo tee -a /etc/sysctl.conf
-        sudo sysctl -p
-
-    - name: Initialization environment
+    - name: Initialization environment (No Swap)
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        echo "=== 初始化环境 ==="
+        echo "=== 初始化环境 (无Swap优化) ==="
         
         # 清理不需要的系统文件
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -136,12 +113,37 @@ jobs:
         sudo mkdir -p /workdir
         sudo chown -R $USER:$GROUPS /workdir
         
-        # 设置 CCache 环境（如果启用）
-        if [ "${{ github.event.inputs.enable_ccache }}" = "true" ]; then
-          echo "CCACHE_DIR=/workdir/ccache" >> $GITHUB_ENV
-          mkdir -p /workdir/ccache
-          echo "CCache 已启用，目录: /workdir/ccache"
+        echo "环境初始化完成"
+
+    - name: Setup CCache directory
+      run: |
+        echo "=== 设置 CCache 缓存 ==="
+        
+        # 创建 CCache 目录
+        CCACHE_DIR="/workdir/ccache"
+        mkdir -p $CCACHE_DIR
+        
+        # 设置 CCache 大小
+        CCACHE_SIZE="${ { github.event.inputs.ccache_size } }G"
+        if [ -z "$CCACHE_SIZE" ] || [ "$CCACHE_SIZE" = "G" ]; then
+          CCACHE_SIZE="10G"
         fi
+        
+        # 配置 CCache
+        export CCACHE_DIR
+        ccache --set-config=max_size=$CCACHE_SIZE
+        ccache --set-config=compression=true
+        ccache --set-config=compression_level=1
+        ccache --set-config=sloppiness=file_macro,include_file_ctime,include_file_mtime
+        ccache -z  # 清空统计
+        
+        echo "CCACHE_DIR=$CCACHE_DIR" >> $GITHUB_ENV
+        echo "CCACHE_SIZE=$CCACHE_SIZE" >> $GITHUB_ENV
+        echo "CCache 已配置: 目录=$CCACHE_DIR, 大小=$CCACHE_SIZE"
+        
+        # 显示 CCache 配置
+        echo "CCache 配置状态:"
+        ccache -p
 
     - name: Clone source code
       working-directory: /workdir
@@ -224,7 +226,10 @@ jobs:
         # 应用配置
         make defconfig
         
-        # 下载依赖包
+        # 下载依赖包（使用 CCache 环境）
+        export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+        export CCACHE_MAXSIZE="${{ env.CCACHE_SIZE }}"
+        
         echo "开始下载软件包..."
         time make download -j$(nproc) || make download -j1
         
@@ -233,57 +238,72 @@ jobs:
         find dl -type f | wc -l
         du -sh dl
 
-    - name: Monitor compile resources
+    - name: Monitor resources and CCache
       run: |
-        echo "=== 编译资源监控开始 ==="
-        # 后台运行资源监控
+        echo "=== 资源与CCache监控开始 ==="
+        # 后台运行监控
         while true; do
           echo "---- $(date +%H:%M:%S) ----"
           echo "内存使用:"
-          free -h | grep -E "Mem|Swap"
+          free -h
           echo "磁盘空间:"
           df -h | grep "/dev/root"
-          echo "CPU 使用率:"
-          top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print "CPU空闲率: " 100-$1 "%"}'
           echo "CCache 状态:"
-          ccache -s 2>/dev/null || echo "CCache 未启用"
+          ccache -s 2>/dev/null | grep -E "cache hit|cache miss|cache size"
           echo "--------------------------------"
           sleep 60
         done &
         MONITOR_PID=$!
-        echo "监控进程 PID: $MONITOR_PID"
         echo "MONITOR_PID=$MONITOR_PID" >> $GITHUB_ENV
 
-    - name: Compile firmware
+    - name: Compile firmware with CCache
+      env:
+        CCACHE_DIR: ${{ env.CCACHE_DIR }}
+        CCACHE_MAXSIZE: ${{ env.CCACHE_SIZE }}
       run: |
-        echo "=== 开始编译固件 ==="
+        echo "=== 开始编译固件 (使用CCache) ==="
         cd openwrt
         
         # 设置编译环境
         export FORCE_UNSAFE_CONFIGURE=1
         
-        # 设置 CCache（如果启用）
-        if [ "${{ github.event.inputs.enable_ccache }}" = "true" ]; then
-          export CCACHE_DIR=/workdir/ccache
-          export CCACHE_MAXSIZE=5G
-          ccache -o compression=true
-          ccache -o max_size=5G
-          echo "CCache 配置:"
-          ccache -s
-        fi
+        # 显示 CCache 初始状态
+        echo "编译前 CCache 状态:"
+        ccache -s
         
         # 显示配置信息
         echo "编译配置摘要:"
         grep -E "CONFIG_TARGET|CONFIG_PACKAGE_luci|CONFIG_PACKAGE_kmod-ath" .config | head -20
         
-        # 开始编译
-        echo "使用单线程编译 (make -j1 V=s)..."
+        # 开始编译（使用单线程确保稳定性）
+        echo "开始编译 (make -j1 V=s)..."
+        
+        # 记录编译开始时间
+        START_TIME=$(date +%s)
+        
+        # 执行编译
         time make -j1 V=s 2>&1 | tee compile.log
+        
+        # 记录编译结束时间
+        END_TIME=$(date +%s)
+        DURATION=$((END_TIME - START_TIME))
+        
+        echo "编译耗时: $((DURATION / 60))分$((DURATION % 60))秒"
         
         # 检查编译结果
         if [ ${PIPESTATUS[0]} -eq 0 ]; then
           echo "✅ 编译成功"
           echo "COMPILE_STATUS=success" >> $GITHUB_ENV
+          
+          # 显示 CCache 命中率
+          echo "编译后 CCache 状态:"
+          ccache -s
+          
+          # 计算命中率
+          HIT_RATE=$(ccache -s | grep "hit rate" | sed 's/[^0-9.]*//g')
+          if [ -n "$HIT_RATE" ]; then
+            echo "CCache 命中率: ${HIT_RATE}%"
+          fi
         else
           echo "❌ 编译失败"
           echo "COMPILE_STATUS=failed" >> $GITHUB_ENV
@@ -295,13 +315,13 @@ jobs:
           exit 1
         fi
 
-    - name: Stop resource monitor
+    - name: Stop monitor
       if: always()
       run: |
-        echo "=== 停止资源监控 ==="
+        echo "=== 停止监控 ==="
         if [ -n "$MONITOR_PID" ]; then
           kill $MONITOR_PID 2>/dev/null || true
-          echo "资源监控已停止"
+          echo "监控已停止"
         fi
 
     - name: Check firmware output
@@ -321,7 +341,7 @@ jobs:
             
             # 查找 Archer C7 v2 固件
             echo "查找 Archer C7 v2 固件:"
-            find . -name "*archer-c7*" -o -name "*archer_c7*" | while read f; do
+            find . -name "*archer-c7*" -o -name "*archer_c7*" -o -name "*c7*" | while read f; do
               echo "- $f ($(du -h "$f" | cut -f1))"
             done
             
@@ -346,11 +366,14 @@ jobs:
               echo "未找到 sysupgrade 固件"
             fi
             
+            # 生成 SHA256 校验文件
+            echo "生成 SHA256 校验..."
+            sha256sum *.bin *.img *.gz 2>/dev/null | tee sha256sums
+            
             # 生成文件列表
             echo "生成文件列表..."
-            ls -la > filelist.txt
-            echo "文件列表:"
-            cat filelist.txt
+            ls -lh > filelist.txt
+            echo "文件列表已保存到 filelist.txt"
           else
             echo "未找到 ath79/generic 目录"
           fi
@@ -371,7 +394,12 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: Archer_C7_v2_Firmware_$(date +%Y%m%d_%H%M)
-        path: ${{ env.FIRMWARE_DIR }}
+        path: |
+          ${{ env.FIRMWARE_DIR }}/*.bin
+          ${{ env.FIRMWARE_DIR }}/*.img
+          ${{ env.FIRMWARE_DIR }}/*.gz
+          ${{ env.FIRMWARE_DIR }}/sha256sums
+          ${{ env.FIRMWARE_DIR }}/filelist.txt
         retention-days: 7
 
     - name: Create release
@@ -386,29 +414,41 @@ jobs:
         
         # 创建 release 说明
         cat > release_notes.md << EOF
-        # OpenWrt for TP-Link Archer C7 v2
+        # OpenWrt for TP-Link Archer C7 v2 (16MB)
         
         ## 固件信息
         - 编译时间: $(date)
         - 源码仓库: $REPO_URL
         - 源码分支: $REPO_BRANCH
-        - 目标设备: TP-Link Archer C7 v2 (16MB)
+        - 目标设备: TP-Link Archer C7 v2 (16MB闪存)
+        - 编译环境: Ubuntu 24.04 + CCache
         
         ## 刷机说明
-        1. 下载固件文件
-        2. 登录原厂固件管理界面
+        1. 下载固件文件（建议使用 \`*-sysupgrade.bin\`）
+        2. 登录原厂固件管理界面（通常为 192.168.0.1 或 192.168.1.1）
         3. 选择固件升级
-        4. 上传 \`*-sysupgrade.bin\` 文件
-        5. 等待刷机完成自动重启
+        4. 上传下载的固件文件
+        5. 等待刷机完成，路由器会自动重启
         
         ## 默认设置
-        - IP 地址: 192.168.1.1
+        - 管理地址: 192.168.1.1
         - 用户名: root
         - 密码: password
+        - 无线默认开启，SSID: OpenWrt
+        
+        ## 注意事项
+        - 确保你的设备是 Archer C7 v2 版本
+        - 刷机前备份原厂固件和配置
+        - 刷机过程中不要断电
         
         ## 文件列表
         \`\`\`
-        $(cd $FIRMWARE_DIR && ls -la)
+        $(cd ${{ env.FIRMWARE_DIR }} && ls -lh)
+        \`\`\`
+        
+        ## 校验信息
+        \`\`\`
+        $(cd ${{ env.FIRMWARE_DIR }} && cat sha256sums 2>/dev/null || echo "未生成校验文件")
         \`\`\`
         EOF
         
@@ -418,18 +458,28 @@ jobs:
           --notes-file release_notes.md \
           ${{ env.FIRMWARE_DIR }}/*.bin \
           ${{ env.FIRMWARE_DIR }}/*.img \
-          ${{ env.FIRMWARE_DIR }}/*.gz
+          ${{ env.FIRMWARE_DIR }}/sha256sums \
+          ${{ env.FIRMWARE_DIR }}/filelist.txt
 
-    - name: Clean up
+    - name: Save CCache for next run
+      if: success() && env.COMPILE_STATUS == 'success'
+      uses: actions/cache@v3
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ${{ runner.os }}-ccache-${{ hashFiles('**/.config') }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+
+    - name: Clean up workspace
       if: always()
       run: |
         echo "=== 清理工作空间 ==="
         
-        # 删除 Swap 文件
-        sudo swapoff /swapfile 2>/dev/null || true
-        sudo rm -f /swapfile 2>/dev/null || true
+        # 显示 CCache 最终状态
+        echo "CCache 最终状态:"
+        ccache -s
         
-        # 清理编译缓存（保留 CCache）
+        # 清理编译中间文件（保留CCache）
         if [ -d "/workdir/openwrt" ]; then
           cd /workdir/openwrt
           make clean 2>/dev/null || true
@@ -439,31 +489,43 @@ jobs:
         # 显示最终磁盘使用情况
         echo "最终磁盘空间:"
         df -h
-        
-        echo "CCache 统计（如果启用）:"
-        ccache -s 2>/dev/null || echo "CCache 未启用"
 
     - name: Generate build report
       if: always()
       run: |
         echo "=== 编译报告 ===" > build_report.md
-        echo "## OpenWrt 编译报告" >> build_report.md
+        echo "## OpenWrt for TP-Link Archer C7 v2 编译报告" >> build_report.md
+        echo "" >> build_report.md
+        echo "### 基本信息" >> build_report.md
         echo "- 编译时间: $(date)" >> build_report.md
-        echo "- 设备: TP-Link Archer C7 v2 (16MB)" >> build_report.md
+        echo "- 设备型号: TP-Link Archer C7 v2 (16MB)" >> build_report.md
         echo "- 编译状态: ${{ env.COMPILE_STATUS || 'unknown' }}" >> build_report.md
-        echo "- 源码: $REPO_URL ($REPO_BRANCH)" >> build_report.md
+        echo "- 源码仓库: $REPO_URL" >> build_report.md
+        echo "- 源码分支: $REPO_BRANCH" >> build_report.md
         
         if [ "${{ env.COMPILE_STATUS }}" = "success" ]; then
-          echo "## 固件信息" >> build_report.md
+          echo "" >> build_report.md
+          echo "### 固件信息" >> build_report.md
           echo "- 固件目录: ${{ env.FIRMWARE_DIR || '未找到' }}" >> build_report.md
-          echo "- 上传时间: $(date +%H:%M:%S)" >> build_report.md
+          
+          if [ -n "${{ env.FIRMWARE_DIR }}" ]; then
+            echo "- 固件文件:" >> build_report.md
+            cd ${{ env.FIRMWARE_DIR }} 2>/dev/null && find . -name "*.bin" -o -name "*.img" | while read f; do
+              SIZE=$(du -h "$f" 2>/dev/null | cut -f1)
+              echo "  - $f ($SIZE)" >> build_report.md
+            done
+          fi
         else
-          echo "## 编译失败" >> build_report.md
-          echo "请查看编译日志获取详细信息" >> build_report.md
+          echo "" >> build_report.md
+          echo "### 编译失败" >> build_report.md
+          echo "编译过程中出现错误，请查看详细日志。" >> build_report.md
         fi
         
-        echo "## 资源使用" >> build_report.md
-        echo "编译过程中资源使用情况已记录在监控日志中" >> build_report.md
+        echo "" >> build_report.md
+        echo "### CCache 统计" >> build_report.md
+        echo "\`\`\`" >> build_report.md
+        ccache -s 2>/dev/null >> build_report.md || echo "CCache 信息不可用" >> build_report.md
+        echo "\`\`\`" >> build_report.md
         
         # 输出报告
         cat build_report.md
